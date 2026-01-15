@@ -1,6 +1,10 @@
 [mongodb-org-8.0]
 name=MongoDB Repository
-baseurl=https://repo.mongodb.org/yum/redhat/8/mongodb-org/8.0/x86_64/
+baseurl=https://repo.mongodb.org/yum/redhat/9/mongodb-org/8.0/$basearch/
 gpgcheck=1
 enabled=1
 gpgkey=https://pgp.mongodb.com/server-8.0.asc
+sslverify=1
+sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+metadata_expire=300
+repo_gpgcheck=1

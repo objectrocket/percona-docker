@@ -1,462 +1,299 @@
 #!/bin/bash
+# Enhanced MongoDB Entrypoint Script for Kubernetes
+# Optimized for Kubernetes deployments with improved signal handling, configuration management, and operator integration
+
 set -Eeuo pipefail
 
-if [ "${1:0:1}" = '-' ]; then
-	set -- mongod "$@"
-fi
+# Configuration variables
+MONGODB_DATA_DIR="${MONGODB_DATA_DIR:-/data/db}"
+MONGODB_LOG_DIR="${MONGODB_LOG_DIR:-/var/log/mongodb}"
+MONGODB_CONFIG_DIR="${MONGODB_CONFIG_DIR:-/etc/mongodb}"
+MONGODB_USER="${MONGODB_USER:-mongodb}"
+MONGODB_UID="${MONGODB_UID:-1001}"
+MONGODB_GID="${MONGODB_GID:-0}"
 
-originalArgOne="$1"
+# Kubernetes-specific variables
+K8S_NAMESPACE="${K8S_NAMESPACE:-}"
+K8S_POD_NAME="${K8S_POD_NAME:-}"
+K8S_SERVICE_NAME="${K8S_SERVICE_NAME:-}"
+REPLICA_SET_NAME="${REPLICA_SET_NAME:-rs0}"
 
-# allow the container to be started with `--user`
-# all mongo* commands should be dropped to the correct user
-if [[ "$originalArgOne" == mongo* ]] && [ "$(id -u)" = '0' ]; then
-	if [ "$originalArgOne" = 'mongod' ]; then
-		if [ -d "/data/configdb" ]; then
-			find /data/configdb \! -user mongodb -exec chown mongodb '{}' +
-		fi
-		if [ -d "/data/db" ]; then
-			find /data/db \! -user mongodb -exec chown mongodb '{}' +
-		fi
-	fi
+# Logging function
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] ENTRYPOINT: $*" >&2
+}
 
-	# make sure we can write to stdout and stderr as "mongodb"
-	# (for our "initdb" code later; see "--logpath" below)
-	chown --dereference mongodb "/proc/$/fd/1" "/proc/$/fd/2" || :
-	# ignore errors thanks to https://github.com/docker-library/mongo/issues/149
+# Error handling
+error_exit() {
+    log "ERROR: $1"
+    exit 1
+}
 
-	exec gosu mongodb:1001 "$BASH_SOURCE" "$@"
-fi
+# Signal handling for graceful shutdown
+shutdown_handler() {
+    log "Received shutdown signal, initiating graceful shutdown..."
+    
+    # If MongoDB is running, try to shut it down gracefully
+    if pgrep -f mongod >/dev/null 2>&1; then
+        log "Shutting down MongoDB gracefully..."
+        
+        # Try to use MongoDB's shutdown command first
+        if mongosh --quiet --eval "db.adminCommand('shutdown')" >/dev/null 2>&1; then
+            log "MongoDB shutdown command sent successfully"
+        else
+            log "MongoDB shutdown command failed, sending SIGTERM to process"
+            pkill -TERM mongod || true
+        fi
+        
+        # Wait for process to exit gracefully
+        local timeout=30
+        while pgrep -f mongod >/dev/null 2>&1 && [ $timeout -gt 0 ]; do
+            sleep 1
+            timeout=$((timeout - 1))
+        done
+        
+        if pgrep -f mongod >/dev/null 2>&1; then
+            log "MongoDB did not shut down gracefully, sending SIGKILL"
+            pkill -KILL mongod || true
+        else
+            log "MongoDB shut down gracefully"
+        fi
+    fi
+    
+    exit 0
+}
 
-# you should use numactl to start your mongod instances, including the config servers, mongos instances, and any clients.
-# https://docs.mongodb.com/manual/administration/production-notes/#configuring-numa-on-linux
-if [[ "$originalArgOne" == mongo* ]]; then
-	numa='numactl --interleave=all'
-	if $numa true &> /dev/null; then
-		set -- $numa "$@"
-	fi
-fi
+# Set up signal handlers
+trap shutdown_handler SIGTERM SIGINT SIGQUIT
 
-# usage: file_env VAR [DEFAULT]
-#    ie: file_env 'XYZ_DB_PASSWORD' 'example'
-# (will allow for "$XYZ_DB_PASSWORD_FILE" to fill in the value of
-#  "$XYZ_DB_PASSWORD" from a file, especially for Docker's secrets feature)
+# Function to setup directories and permissions
+setup_directories() {
+    log "Setting up directories and permissions..."
+    
+    # Create necessary directories
+    for dir in "$MONGODB_DATA_DIR" "$MONGODB_LOG_DIR" "$MONGODB_CONFIG_DIR" "/tmp/mongodb"; do
+        if [[ ! -d "$dir" ]]; then
+            mkdir -p "$dir"
+            log "Created directory: $dir"
+        fi
+    done
+    
+    # Set ownership and permissions for Kubernetes/OpenShift compatibility
+    chown -R "$MONGODB_UID:$MONGODB_GID" "$MONGODB_DATA_DIR" "$MONGODB_LOG_DIR" "$MONGODB_CONFIG_DIR" "/tmp/mongodb" 2>/dev/null || true
+    chmod -R g+rwx "$MONGODB_DATA_DIR" "$MONGODB_LOG_DIR" "$MONGODB_CONFIG_DIR" "/tmp/mongodb" 2>/dev/null || true
+    chmod -R o-rwx "$MONGODB_DATA_DIR" "$MONGODB_LOG_DIR" "$MONGODB_CONFIG_DIR" 2>/dev/null || true
+}
+
+# Function to handle file-based environment variables (Kubernetes secrets)
 file_env() {
-	local var="$1"
-	local fileVar="${var}_FILE"
-	local def="${2:-}"
-	if [ "${!var:-}" ] && [ "${!fileVar:-}" ]; then
-		echo >&2 "error: both $var and $fileVar are set (but are exclusive)"
-		exit 1
-	fi
-	local val="$def"
-	if [ "${!var:-}" ]; then
-		val="${!var}"
-	elif [ "${!fileVar:-}" ]; then
-		val="$(< "${!fileVar}")"
-	fi
-	export "$var"="$val"
-	unset "$fileVar"
+    local var="$1"
+    local fileVar="${var}_FILE"
+    local def="${2:-}"
+    
+    if [[ -n "${!var:-}" ]] && [[ -n "${!fileVar:-}" ]]; then
+        error_exit "Both $var and $fileVar are set (but are exclusive)"
+    fi
+    
+    local val="$def"
+    if [[ -n "${!var:-}" ]]; then
+        val="${!var}"
+    elif [[ -n "${!fileVar:-}" ]]; then
+        if [[ -f "${!fileVar}" ]]; then
+            val="$(< "${!fileVar}")"
+        else
+            error_exit "File ${!fileVar} does not exist"
+        fi
+    fi
+    
+    export "$var"="$val"
+    unset "$fileVar" 2>/dev/null || true
 }
 
-# see https://github.com/docker-library/mongo/issues/147 (mongod is picky about duplicated arguments)
-_mongod_hack_have_arg() {
-	local checkArg="$1"; shift
-	local arg
-	for arg; do
-		case "$arg" in
-			"$checkArg"|"$checkArg"=*)
-				return 0
-				;;
-		esac
-	done
-	return 1
-}
-# _mongod_hack_get_arg_val '--some-arg' "$@"
-_mongod_hack_get_arg_val() {
-	local checkArg="$1"; shift
-	while [ "$#" -gt 0 ]; do
-		local arg="$1"; shift
-		case "$arg" in
-			"$checkArg")
-				echo "$1"
-				return 0
-				;;
-			"$checkArg"=*)
-				echo "${arg#$checkArg=}"
-				return 0
-				;;
-		esac
-	done
-	return 1
-}
-declare -a mongodHackedArgs
-# _mongod_hack_ensure_arg '--some-arg' "$@"
-# set -- "${mongodHackedArgs[@]}"
-_mongod_hack_ensure_arg() {
-	local ensureArg="$1"; shift
-	mongodHackedArgs=( "$@" )
-	if ! _mongod_hack_have_arg "$ensureArg" "$@"; then
-		mongodHackedArgs+=( "$ensureArg" )
-	fi
-}
-# _mongod_hack_ensure_no_arg '--some-unwanted-arg' "$@"
-# set -- "${mongodHackedArgs[@]}"
-_mongod_hack_ensure_no_arg() {
-	local ensureNoArg="$1"; shift
-	mongodHackedArgs=()
-	while [ "$#" -gt 0 ]; do
-		local arg="$1"; shift
-		if [ "$arg" = "$ensureNoArg" ]; then
-			continue
-		fi
-		mongodHackedArgs+=( "$arg" )
-	done
-}
-# _mongod_hack_ensure_no_arg '--some-unwanted-arg' "$@"
-# set -- "${mongodHackedArgs[@]}"
-_mongod_hack_ensure_no_arg_val() {
-	local ensureNoArg="$1"; shift
-	mongodHackedArgs=()
-	while [ "$#" -gt 0 ]; do
-		local arg="$1"; shift
-		case "$arg" in
-			"$ensureNoArg")
-				shift # also skip the value
-				continue
-				;;
-			"$ensureNoArg"=*)
-				# value is already included
-				continue
-				;;
-		esac
-		mongodHackedArgs+=( "$arg" )
-	done
-}
-# _mongod_hack_ensure_arg_val '--some-arg' 'some-val' "$@"
-# set -- "${mongodHackedArgs[@]}"
-_mongod_hack_ensure_arg_val() {
-	local ensureArg="$1"; shift
-	local ensureVal="$1"; shift
-	_mongod_hack_ensure_no_arg_val "$ensureArg" "$@"
-	mongodHackedArgs+=( "$ensureArg" "$ensureVal" )
+# Function to generate MongoDB configuration
+generate_config() {
+    local config_file="$MONGODB_CONFIG_DIR/mongod.conf"
+    
+    log "Generating MongoDB configuration..."
+    
+    # Start with template if it exists
+    if [[ -f "$MONGODB_CONFIG_DIR/mongod.conf.template" ]]; then
+        cp "$MONGODB_CONFIG_DIR/mongod.conf.template" "$config_file"
+    else
+        # Create basic configuration
+        cat > "$config_file" << EOF
+# MongoDB configuration for Kubernetes
+storage:
+  dbPath: $MONGODB_DATA_DIR
+  journal:
+    enabled: true
+
+systemLog:
+  destination: file
+  logAppend: true
+  path: $MONGODB_LOG_DIR/mongod.log
+  logRotate: reopen
+
+net:
+  port: 27017
+  bindIpAll: true
+
+processManagement:
+  timeZoneInfo: /usr/share/zoneinfo
+
+security:
+  authorization: disabled
+EOF
+    fi
+    
+    # Add replica set configuration if specified
+    if [[ -n "$REPLICA_SET_NAME" ]]; then
+        if ! grep -q "replication:" "$config_file"; then
+            cat >> "$config_file" << EOF
+
+replication:
+  replSetName: $REPLICA_SET_NAME
+EOF
+        fi
+    fi
+    
+    # Set proper permissions
+    chown "$MONGODB_UID:$MONGODB_GID" "$config_file"
+    chmod 640 "$config_file"
+    
+    log "MongoDB configuration generated at $config_file"
 }
 
-# required by mongodb 4.2
-# _mongod_hack_rename_arg_save_val '--arg-to-rename' '--arg-to-rename-to' "$@"
-# set -- "${mongodHackedArgs[@]}"
-_mongod_hack_rename_arg_save_val() {
-	local oldArg="$1"; shift
-	local newArg="$1"; shift
-	if ! _mongod_hack_have_arg "$oldArg" "$@"; then
-		return 0
-	fi
-	local val=""
-	mongodHackedArgs=()
-	while [ "$#" -gt 0 ]; do
-		local arg="$1"; shift
-		if [ "$arg" = "$oldArg" ]; then
-			val="$1"; shift
-			continue
-		elif [[ "$arg" =~ "$oldArg"=(.*) ]]; then
-			val=${BASH_REMATCH[1]}
-			continue
-		fi
-		mongodHackedArgs+=("$arg")
-	done
-	mongodHackedArgs+=("$newArg" "$val")
+# Function to wait for network readiness
+wait_for_network() {
+    log "Waiting for network readiness..."
+    
+    local timeout=30
+    while [ $timeout -gt 0 ]; do
+        if ss -tuln | grep -q ":27017 "; then
+            log "Port 27017 is already in use, waiting..."
+            sleep 1
+            timeout=$((timeout - 1))
+        else
+            break
+        fi
+    done
+    
+    if [ $timeout -eq 0 ]; then
+        log "Warning: Port 27017 may still be in use"
+    fi
 }
 
-# required by mongodb 4.2
-# _mongod_hack_rename_arg'--arg-to-rename' '--arg-to-rename-to' "$@"
-# set -- "${mongodHackedArgs[@]}"
-_mongod_hack_rename_arg() {
-	local oldArg="$1"; shift
-	local newArg="$1"; shift
-	if _mongod_hack_have_arg "$oldArg" "$@"; then
-		_mongod_hack_ensure_no_arg "$oldArg" "$@"
-		_mongod_hack_ensure_arg "$newArg" "${mongodHackedArgs[@]}"
-	fi
+# Function to initialize MongoDB if needed
+initialize_mongodb() {
+    log "Checking if MongoDB initialization is needed..."
+    
+    # Check if this is a fresh installation
+    if [[ ! -f "$MONGODB_DATA_DIR/WiredTiger" ]] && [[ ! -f "$MONGODB_DATA_DIR/mongod.lock" ]]; then
+        log "Fresh MongoDB installation detected"
+        
+        # Handle initialization scripts
+        file_env 'MONGO_INITDB_ROOT_USERNAME'
+        file_env 'MONGO_INITDB_ROOT_PASSWORD'
+        file_env 'MONGO_INITDB_DATABASE'
+        
+        if [[ -n "${MONGO_INITDB_ROOT_USERNAME:-}" ]] && [[ -n "${MONGO_INITDB_ROOT_PASSWORD:-}" ]]; then
+            log "Root user credentials provided, will initialize with authentication"
+            export MONGO_INITDB_ROOT_USERNAME
+            export MONGO_INITDB_ROOT_PASSWORD
+            export MONGO_INITDB_DATABASE="${MONGO_INITDB_DATABASE:-admin}"
+        fi
+    else
+        log "Existing MongoDB data found, skipping initialization"
+    fi
 }
 
-# _js_escape 'some "string" value'
-_js_escape() {
-	jq --null-input --arg 'str' "$1" '$str'
+# Function to setup MongoDB arguments with Kubernetes optimizations
+setup_mongodb_args() {
+    local -a mongod_args=("$@")
+    
+    # If no arguments provided, use default
+    if [[ ${#mongod_args[@]} -eq 0 ]]; then
+        mongod_args=("mongod")
+    fi
+    
+    # If first argument starts with -, prepend mongod
+    if [[ "${mongod_args[0]:0:1}" = '-' ]]; then
+        mongod_args=("mongod" "${mongod_args[@]}")
+    fi
+    
+    # Add Kubernetes-specific optimizations
+    local -a k8s_args=()
+    
+    # Use configuration file if it exists
+    if [[ -f "$MONGODB_CONFIG_DIR/mongod.conf" ]]; then
+        k8s_args+=("--config" "$MONGODB_CONFIG_DIR/mongod.conf")
+    fi
+    
+    # Kubernetes-specific settings
+    k8s_args+=(
+        "--bind_ip_all"
+        "--logpath" "$MONGODB_LOG_DIR/mongod.log"
+        "--logappend"
+    )
+    
+    # Add NUMA optimization if available
+    if command -v numactl >/dev/null 2>&1 && numactl --hardware >/dev/null 2>&1; then
+        mongod_args=("numactl" "--interleave=all" "${mongod_args[@]}")
+    fi
+    
+    # Combine arguments
+    mongod_args+=("${k8s_args[@]}")
+    
+    echo "${mongod_args[@]}"
 }
 
-jsonConfigFile="${TMPDIR:-/tmp}/docker-entrypoint-config.json"
-tempConfigFile="${TMPDIR:-/tmp}/docker-entrypoint-temp-config.json"
-_parse_config() {
-	if [ -s "$tempConfigFile" ]; then
-		return 0
-	fi
-
-	local configPath
-	if configPath="$(_mongod_hack_get_arg_val --config "$@")"; then
-		# if --config is specified, parse it into a JSON file so we can remove a few problematic keys (especially SSL-related keys)
-		# see https://docs.mongodb.com/manual/reference/configuration-options/
-                mongosh --norc --nodb --quiet --eval "load('/js-yaml.js'); JSON.stringify(jsyaml.load(fs.readFileSync($(_js_escape "$configPath"), 'utf8')))" > "$jsonConfigFile"
-		jq 'del(.systemLog, .processManagement, .net, .security)' "$jsonConfigFile" > "$tempConfigFile"
-		return 0
-	fi
-
-	return 1
-}
-dbPath=
-_dbPath() {
-	if [ -n "$dbPath" ]; then
-		echo "$dbPath"
-		return
-	fi
-
-	if ! dbPath="$(_mongod_hack_get_arg_val --dbpath "$@")"; then
-		if _parse_config "$@"; then
-			dbPath="$(jq -r '.storage.dbPath // empty' "$jsonConfigFile")"
-		fi
-	fi
-
-	: "${dbPath:=/data/db}"
-
-	echo "$dbPath"
+# Function to start MongoDB with proper user switching
+start_mongodb() {
+    local -a mongod_cmd=($@)
+    
+    log "Starting MongoDB with command: ${mongod_cmd[*]}"
+    
+    # Ensure we're running as the correct user
+    if [[ "$(id -u)" = '0' ]]; then
+        # Running as root, switch to mongodb user
+        log "Running as root, switching to user $MONGODB_USER (UID: $MONGODB_UID)"
+        
+        # Ensure ownership of critical files
+        chown "$MONGODB_UID:$MONGODB_GID" "$MONGODB_DATA_DIR" "$MONGODB_LOG_DIR" 2>/dev/null || true
+        
+        # Use gosu to switch user and exec
+        exec gosu "$MONGODB_UID:$MONGODB_GID" "${mongod_cmd[@]}"
+    else
+        # Already running as non-root user
+        log "Running as user $(id -un) (UID: $(id -u))"
+        exec "${mongod_cmd[@]}"
+    fi
 }
 
-if [ "$originalArgOne" = 'mongod' ]; then
-	file_env 'MONGO_INITDB_ROOT_USERNAME'
-	file_env 'MONGO_INITDB_ROOT_PASSWORD'
-	# pre-check a few factors to see if it's even worth bothering with initdb
-	shouldPerformInitdb=
-	if [ "$MONGO_INITDB_ROOT_USERNAME" ] && [ "$MONGO_INITDB_ROOT_PASSWORD" ]; then
-		# if we have a username/password, let's set "--auth"
-		_mongod_hack_ensure_arg '--auth' "$@"
-		set -- "${mongodHackedArgs[@]}"
-		shouldPerformInitdb='true'
-	elif [ "$MONGO_INITDB_ROOT_USERNAME" ] || [ "$MONGO_INITDB_ROOT_PASSWORD" ]; then
-		cat >&2 <<-'EOF'
+# Main execution function
+main() {
+    log "Starting MongoDB entrypoint for Kubernetes..."
+    log "Pod: ${K8S_POD_NAME:-unknown}, Namespace: ${K8S_NAMESPACE:-unknown}"
+    
+    # Setup directories and permissions
+    setup_directories
+    
+    # Wait for network readiness
+    wait_for_network
+    
+    # Generate configuration
+    generate_config
+    
+    # Initialize MongoDB if needed
+    initialize_mongodb
+    
+    # Setup MongoDB arguments
+    local -a final_args
+    IFS=' ' read -ra final_args <<< "$(setup_mongodb_args "$@")"
+    
+    # Start MongoDB
+    start_mongodb "${final_args[@]}"
+}
 
-			error: missing 'MONGO_INITDB_ROOT_USERNAME' or 'MONGO_INITDB_ROOT_PASSWORD'
-			       both must be specified for a user to be created
-
-		EOF
-		exit 1
-	fi
-
-	if [ -z "$shouldPerformInitdb" ]; then
-		# if we've got any /docker-entrypoint-initdb.d/* files to parse later, we should initdb
-		for f in /docker-entrypoint-initdb.d/*; do
-			case "$f" in
-				*.sh|*.js) # this should match the set of files we check for below
-					shouldPerformInitdb="$f"
-					break
-					;;
-			esac
-		done
-	fi
-
-	# check for a few known paths (to determine whether we've already initialized and should thus skip our initdb scripts)
-	if [ -n "$shouldPerformInitdb" ]; then
-		dbPath="$(_dbPath "$@")"
-		for path in \
-			"$dbPath/WiredTiger" \
-			"$dbPath/journal" \
-			"$dbPath/local.0" \
-			"$dbPath/storage.bson" \
-		; do
-			if [ -e "$path" ]; then
-				shouldPerformInitdb=
-				break
-			fi
-		done
-	fi
-
-	if [ -n "$shouldPerformInitdb" ]; then
-		mongodHackedArgs=( "$@" )
-		_mongod_hack_ensure_arg_val --bind_ip 127.0.0.1 "${mongodHackedArgs[@]}"
-		_mongod_hack_ensure_arg_val --port 27017 "${mongodHackedArgs[@]}"
-		_mongod_hack_ensure_no_arg --bind_ip_all "${mongodHackedArgs[@]}"
-
-		# remove "--auth" and "--replSet" for our initial startup (see https://docs.mongodb.com/manual/tutorial/enable-authentication/#start-mongodb-without-access-control)
-		# https://github.com/docker-library/mongo/issues/211
-		_mongod_hack_ensure_no_arg --auth "${mongodHackedArgs[@]}"
-		if [ "$MONGO_INITDB_ROOT_USERNAME" ] && [ "$MONGO_INITDB_ROOT_PASSWORD" ]; then
-			_mongod_hack_ensure_no_arg_val --replSet "${mongodHackedArgs[@]}"
-		fi
-
-		# "BadValue: need sslPEMKeyFile when SSL is enabled" vs "BadValue: need to enable SSL via the sslMode flag when using SSL configuration parameters"
-		tlsMode='disabled'
-		if _mongod_hack_have_arg '--tlsCertificateKeyFile' "${mongodHackedArgs[@]}"; then
-			tlsMode='preferTLS'
-		elif _mongod_hack_have_arg '--sslPEMKeyFile' "${mongodHackedArgs[@]}"; then
-			tlsMode='preferSSL'
-		fi
-		# 4.2 switched all configuration/flag names from "SSL" to "TLS"
-		if [ "$tlsMode" = 'preferTLS' ] || mongod --help 2>&1 | grep -q -- ' --tlsMode '; then
-			_mongod_hack_ensure_arg_val --tlsMode "$tlsMode" "${mongodHackedArgs[@]}"
-		else
-			_mongod_hack_ensure_arg_val --sslMode "$tlsMode" "${mongodHackedArgs[@]}"
-		fi
-
-		if stat "/proc/$/fd/1" > /dev/null && [ -w "/proc/$/fd/1" ]; then
-			# https://github.com/mongodb/mongo/blob/38c0eb538d0fd390c6cb9ce9ae9894153f6e8ef5/src/mongo/db/initialize_server_global_state.cpp#L237-L251
-			# https://github.com/docker-library/mongo/issues/164#issuecomment-293965668
-			_mongod_hack_ensure_arg_val --logpath "/proc/$/fd/1" "${mongodHackedArgs[@]}"
-		else
-			initdbLogPath="$(_dbPath "$@")/docker-initdb.log"
-			echo >&2 "warning: initdb logs cannot write to '/proc/$/fd/1', so they are in '$initdbLogPath' instead"
-			_mongod_hack_ensure_arg_val --logpath "$initdbLogPath" "${mongodHackedArgs[@]}"
-		fi
-		_mongod_hack_ensure_arg --logappend "${mongodHackedArgs[@]}"
-
-		pidfile="${TMPDIR:-/tmp}/docker-entrypoint-temp-mongod.pid"
-		rm -f "$pidfile"
-		_mongod_hack_ensure_arg_val --pidfilepath "$pidfile" "${mongodHackedArgs[@]}"
-
-		"${mongodHackedArgs[@]}" --fork
-
-		mongo=( mongosh --host 127.0.0.1 --port 27017 --quiet )
-
-		# check to see that our "mongod" actually did start up (catches "--help", "--version", MongoDB 3.2 being silly, slow prealloc, etc)
-		# https://jira.mongodb.org/browse/SERVER-16292
-		tries=30
-		while true; do
-			if ! { [ -s "$pidfile" ] && ps "$(< "$pidfile")" &> /dev/null; }; then
-				# bail ASAP if "mongod" isn't even running
-				echo >&2
-				echo >&2 "error: $originalArgOne does not appear to have stayed running -- perhaps it had an error?"
-				echo >&2
-				exit 1
-			fi
-			if "${mongo[@]}" 'admin' --eval 'quit(0)' &> /dev/null; then
-				# success!
-				break
-			fi
-			(( tries-- ))
-			if [ "$tries" -le 0 ]; then
-				echo >&2
-				echo >&2 "error: $originalArgOne does not appear to have accepted connections quickly enough -- perhaps it had an error?"
-				echo >&2
-				exit 1
-			fi
-			sleep 1
-		done
-
-		if [ "$MONGO_INITDB_ROOT_USERNAME" ] && [ "$MONGO_INITDB_ROOT_PASSWORD" ]; then
-			rootAuthDatabase='admin'
-
-			"${mongo[@]}" "$rootAuthDatabase" <<-EOJS
-				db.createUser({
-					user: $(_js_escape "$MONGO_INITDB_ROOT_USERNAME"),
-					pwd: $(_js_escape "$MONGO_INITDB_ROOT_PASSWORD"),
-					roles: [ { role: 'root', db: $(_js_escape "$rootAuthDatabase") } ]
-				})
-			EOJS
-		fi
-
-		export MONGO_INITDB_DATABASE="${MONGO_INITDB_DATABASE:-test}"
-
-		echo
-		for f in /docker-entrypoint-initdb.d/*; do
-			case "$f" in
-				*.sh) echo "$0: running $f"; . "$f" ;;
-				*.js) echo "$0: running $f"; "${mongo[@]}" "$MONGO_INITDB_DATABASE" "$f"; echo ;;
-				*)    echo "$0: ignoring $f" ;;
-			esac
-			echo
-		done
-
-		"${mongodHackedArgs[@]}" --shutdown
-		rm -f "$pidfile"
-
-		echo
-		echo 'MongoDB init process complete; ready for start up.'
-		echo
-	fi
-
-	mongodHackedArgs=("$@")
-	MONGO_SSL_DIR=${MONGO_SSL_DIR:-/etc/mongodb-ssl}
-	CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-	if [ -f /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt ]; then
-		CA=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
-	fi
-	if [ -f "${MONGO_SSL_DIR}/ca.crt" ]; then
-		CA="${MONGO_SSL_DIR}/ca.crt"
-	fi
-	if [ -f "${MONGO_SSL_DIR}/tls.key" ] && [ -f "${MONGO_SSL_DIR}/tls.crt" ]; then
-		cat "${MONGO_SSL_DIR}/tls.key" "${MONGO_SSL_DIR}/tls.crt" >/tmp/tls.pem
-		_mongod_hack_ensure_arg_val --sslPEMKeyFile /tmp/tls.pem "${mongodHackedArgs[@]}"
-		if [ -f "${CA}" ]; then
-			_mongod_hack_ensure_arg_val --sslCAFile "${CA}" "${mongodHackedArgs[@]}"
-		fi
-	fi
-	MONGO_SSL_INTERNAL_DIR=${MONGO_SSL_INTERNAL_DIR:-/etc/mongodb-ssl-internal}
-	if [ -f "${MONGO_SSL_INTERNAL_DIR}/tls.key" ] && [ -f "${MONGO_SSL_INTERNAL_DIR}/tls.crt" ]; then
-		cat "${MONGO_SSL_INTERNAL_DIR}/tls.key" "${MONGO_SSL_INTERNAL_DIR}/tls.crt" >/tmp/tls-internal.pem
-		_mongod_hack_ensure_arg_val --sslClusterFile /tmp/tls-internal.pem "${mongodHackedArgs[@]}"
-		if [ -f "${MONGO_SSL_INTERNAL_DIR}/ca.crt" ]; then
-			_mongod_hack_ensure_arg_val --sslClusterCAFile "${MONGO_SSL_INTERNAL_DIR}/ca.crt" "${mongodHackedArgs[@]}"
-		fi
-	fi
-
-	MONGODB_VERSION=$(mongod --version  | head -1 | awk '{print $3}' | awk -F'.' '{print $1"."$2}')
-	if [ "$MONGODB_VERSION" == 'v4.2' ] || [ "$MONGODB_VERSION" == 'v4.4' ] || [ "$MONGODB_VERSION" == 'v5.0' ] || [ "$MONGODB_VERSION" == 'v6.0' ] || [ "$MONGODB_VERSION" == 'v7.0' ] || [ "$MONGODB_VERSION" == 'v8.0' ]; then
-		_mongod_hack_rename_arg_save_val --sslMode --tlsMode "${mongodHackedArgs[@]}"
-
-		if _mongod_hack_have_arg '--tlsMode' "${mongodHackedArgs[@]}"; then
-			tlsMode="none"
-			if _mongod_hack_have_arg 'allowSSL' "${mongodHackedArgs[@]}"; then
-				tlsMode='allowTLS'
-			elif _mongod_hack_have_arg 'preferSSL' "${mongodHackedArgs[@]}"; then
-				tlsMode='preferTLS'
-			elif _mongod_hack_have_arg 'requireSSL' "${mongodHackedArgs[@]}"; then
-				tlsMode='requireTLS'
-			fi
-
-			if [ "$tlsMode" != "none" ]; then
-				_mongod_hack_ensure_no_arg_val --tlsMode "${mongodHackedArgs[@]}"
-				_mongod_hack_ensure_arg_val --tlsMode "$tlsMode" "${mongodHackedArgs[@]}"
-			fi
-		fi
-
-		_mongod_hack_rename_arg_save_val --sslPEMKeyFile --tlsCertificateKeyFile "${mongodHackedArgs[@]}"
-		if ! _mongod_hack_have_arg '--tlsMode' "${mongodHackedArgs[@]}"; then
-			if _mongod_hack_have_arg '--tlsCertificateKeyFile' "${mongodHackedArgs[@]}"; then
-				_mongod_hack_ensure_arg_val --tlsMode "preferTLS" "${mongodHackedArgs[@]}"
-			fi
-		fi
-		_mongod_hack_rename_arg '--sslAllowInvalidCertificates' '--tlsAllowInvalidCertificates' "${mongodHackedArgs[@]}"
-		_mongod_hack_rename_arg '--sslAllowInvalidHostnames' '--tlsAllowInvalidHostnames' "${mongodHackedArgs[@]}"
-		_mongod_hack_rename_arg '--sslAllowConnectionsWithoutCertificates' '--tlsAllowConnectionsWithoutCertificates' "${mongodHackedArgs[@]}"
-		_mongod_hack_rename_arg '--sslFIPSMode' '--tlsFIPSMode' "${mongodHackedArgs[@]}"
-
-
-		_mongod_hack_rename_arg_save_val --sslPEMKeyPassword --tlsCertificateKeyFilePassword "${mongodHackedArgs[@]}"
-		_mongod_hack_rename_arg_save_val --sslClusterFile --tlsClusterFile "${mongodHackedArgs[@]}"
-		_mongod_hack_rename_arg_save_val --sslCertificateSelector --tlsCertificateSelector "${mongodHackedArgs[@]}"
-		_mongod_hack_rename_arg_save_val --sslClusterCertificateSelector --tlsClusterCertificateSelector "${mongodHackedArgs[@]}"
-		_mongod_hack_rename_arg_save_val --sslClusterPassword --tlsClusterPassword "${mongodHackedArgs[@]}"
-		_mongod_hack_rename_arg_save_val --sslCAFile --tlsCAFile "${mongodHackedArgs[@]}"
-		_mongod_hack_rename_arg_save_val --sslClusterCAFile --tlsClusterCAFile "${mongodHackedArgs[@]}"
-		_mongod_hack_rename_arg_save_val --sslCRLFile --tlsCRLFile "${mongodHackedArgs[@]}"
-		_mongod_hack_rename_arg_save_val --sslDisabledProtocols --tlsDisabledProtocols "${mongodHackedArgs[@]}"
-	fi
-
-	set -- "${mongodHackedArgs[@]}"
-
-	# MongoDB 3.6+ defaults to localhost-only binding
-	haveBindIp=
-	if _mongod_hack_have_arg --bind_ip "$@" || _mongod_hack_have_arg --bind_ip_all "$@"; then
-		haveBindIp=1
-	elif _parse_config "$@" && jq --exit-status '.net.bindIp // .net.bindIpAll' "$jsonConfigFile" > /dev/null; then
-		haveBindIp=1
-	fi
-	if [ -z "$haveBindIp" ]; then
-		# so if no "--bind_ip" is specified, let's add "--bind_ip_all"
-		set -- "$@" --bind_ip_all
-	fi
-
-	unset "${!MONGO_INITDB_@}"
-fi
-
-rm -f "$jsonConfigFile" "$tempConfigFile"
-
-set -o xtrace +u
-
-exec "$@"
+# Execute main function with all arguments
+main "$@"

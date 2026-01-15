@@ -8,8 +8,8 @@ LABEL name="MongoDB Community Edition" \
 	maintainer="Percona Development <info@percona.com>"
 LABEL org.opencontainers.image.authors="info@percona.com"
 
-ENV PSMDB_VERSION 8.0.3
-ENV OS_VER el9
+ENV PSMDB_VERSION=8.0.3
+ENV OS_VER=el9
 
 # Do not report during Docker image creation.
 ARG PERCONA_TELEMETRY_DISABLE=1
@@ -17,8 +17,7 @@ ARG PERCONA_TELEMETRY_DISABLE=1
 COPY mongodb.repo /etc/yum.repos.d/mongodb.repo
 
 RUN set -ex; \
-    microdnf -y update glibc; \
-    microdnf -y update libgcrypt; \
+    microdnf -y update; \
     microdnf -y install \
         mongodb-org-${PSMDB_VERSION} \
         mongodb-org-database-${PSMDB_VERSION} \
@@ -26,24 +25,23 @@ RUN set -ex; \
         mongodb-mongosh \
         mongodb-org-mongos-${PSMDB_VERSION} \
         mongodb-org-tools-${PSMDB_VERSION} \
-        numactl \
         numactl-libs \
         procps-ng \
         jq \
         tar \
         oniguruma \
         cyrus-sasl-gssapi \
-        cyrus-sasl-plain \
-        policycoreutils; \
+        cyrus-sasl-plain; \
     microdnf clean all; \
-    rm -rf /var/cache/dnf /var/cache/yum /data/db && mkdir -p /data/db; \
+    rm -rf /var/cache/yum /data/db && mkdir -p /data/db; \
     chown -R 1001:0 /data/db
 
 # the numeric UID is needed for OpenShift
 RUN useradd -u 1001 -r -g 0 -m -s /sbin/nologin \
             -c "Default Application User" mongodb; \
-    chmod g+rwx /var/log/mongo; \
-    chown :0 /var/log/mongo
+    mkdir -p /var/log/mongo /etc/mongodb; \
+    chmod g+rwx /var/log/mongo /etc/mongodb; \
+    chown :0 /var/log/mongo /etc/mongodb
 
 COPY LICENSE /licenses/LICENSE.Dockerfile
 RUN cp /usr/share/doc/mongodb-org-server/LICENSE-Community.txt /licenses/LICENSE.MongoDB-Community || \
@@ -69,6 +67,7 @@ RUN set -ex; \
     echo "45dc3dd03dc07a06705a2c2989b8c7f709013f04bd5386e3279d4e447f07ebd7  /js-yaml.js" | sha256sum -c -
 
 COPY ps-entry.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
 
