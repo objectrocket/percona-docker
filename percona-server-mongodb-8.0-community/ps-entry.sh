@@ -270,8 +270,41 @@ start_mongodb() {
     fi
 }
 
+# Function to check if command is MongoDB-related
+is_mongodb_command() {
+    local cmd="$1"
+    
+    # List of MongoDB-related commands
+    case "$cmd" in
+        mongod|mongos|mongo|mongosh)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # Main execution function
 main() {
+    # Check if we should run MongoDB initialization or just exec the command
+    local first_arg="${1:-mongod}"
+    
+    # If the first argument is not a MongoDB command, just exec it directly
+    # This allows for command overrides like: docker run image echo "hello"
+    if ! is_mongodb_command "$first_arg"; then
+        log "Non-MongoDB command detected: $first_arg"
+        log "Executing command directly without MongoDB initialization"
+        
+        # If running as root, switch to mongodb user for consistency
+        if [[ "$(id -u)" = '0' ]]; then
+            exec gosu "$MONGODB_UID:$MONGODB_GID" "$@"
+        else
+            exec "$@"
+        fi
+    fi
+    
+    # MongoDB command detected, proceed with full initialization
     log "Starting MongoDB entrypoint for Kubernetes..."
     log "Pod: ${K8S_POD_NAME:-unknown}, Namespace: ${K8S_NAMESPACE:-unknown}"
     
