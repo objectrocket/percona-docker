@@ -8,7 +8,7 @@ LABEL name="MongoDB Community Edition" \
 	maintainer="Percona Development <info@percona.com>"
 LABEL org.opencontainers.image.authors="info@percona.com"
 
-ENV PSMDB_VERSION=8.0.3
+ENV PSMDB_VERSION=8.0.17
 ENV OS_VER=el9
 
 # Do not report during Docker image creation.
