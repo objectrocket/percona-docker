@@ -1,0 +1,198 @@
+# Multi-architecture MongoDB Community Edition for Kubernetes
+# This Dockerfile is optimized for Kubernetes deployments with multi-arch support
+
+ARG TARGETARCH
+ARG TARGETOS
+ARG TARGETPLATFORM
+
+FROM --platform=${TARGETPLATFORM} redhat/ubi9-minimal
+
+# Kubernetes and OpenShift compatibility labels
+LABEL name="MongoDB Community Edition for Kubernetes" \
+    release="8.2" \
+    version="8.2.3" \
+    vendor="MongoDB Inc." \
+    summary="MongoDB Community Edition optimized for Kubernetes with Percona operator compatibility" \
+    description="Multi-architecture MongoDB Community Edition container optimized for Kubernetes deployments. Includes enhanced security, health checks, and operator integration." \
+    maintainer="Percona Development <info@percona.com>" \
+    io.k8s.description="MongoDB Community Edition for Kubernetes" \
+    io.k8s.display-name="MongoDB Community 8.2" \
+    io.openshift.expose-services="27017:mongodb" \
+    io.openshift.tags="database,mongodb,nosql"
+
+LABEL org.opencontainers.image.title="MongoDB Community Edition for Kubernetes" \
+    org.opencontainers.image.description="Multi-architecture MongoDB Community Edition optimized for Kubernetes" \
+    org.opencontainers.image.version="8.2.3" \
+    org.opencontainers.image.authors="info@percona.com" \
+    org.opencontainers.image.vendor="Percona" \
+    org.opencontainers.image.licenses="SSPL-1.0" \
+    org.opencontainers.image.source="https://github.com/percona/percona-docker" \
+    org.opencontainers.image.documentation="https://docs.percona.com/"
+
+# Environment variables for MongoDB and Kubernetes
+ENV PSMDB_VERSION=8.2.3 \
+    OS_VER=el9 \
+    MONGODB_VERSION=8.2 \
+    GOSU_VERSION=1.17 \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Kubernetes-specific environment variables
+ENV MONGODB_DATA_DIR=/data/db \
+    MONGODB_LOG_DIR=/var/log/mongodb \
+    MONGODB_CONFIG_DIR=/etc/mongodb \
+    MONGODB_USER=mongodb \
+    MONGODB_UID=1001 \
+    MONGODB_GID=0
+
+# Security and telemetry settings
+ARG PERCONA_TELEMETRY_DISABLE=1
+ENV PERCONA_TELEMETRY_DISABLE=${PERCONA_TELEMETRY_DISABLE}
+
+# Copy repository configuration with architecture detection
+COPY mongodb.repo /etc/yum.repos.d/mongodb.repo
+
+# Install MongoDB and dependencies with multi-arch support
+RUN set -ex; \
+    # Update system packages
+    microdnf -y update; \
+    \
+    # Install required system packages
+    microdnf -y install \
+        shadow-utils \
+        findutils \
+        tar \
+        gzip \
+        procps-ng; \
+    \
+    # Install MongoDB packages
+    microdnf -y install \
+        mongodb-org-${PSMDB_VERSION} \
+        mongodb-org-database-${PSMDB_VERSION} \
+        mongodb-org-server-${PSMDB_VERSION} \
+        mongodb-mongosh \
+        mongodb-org-mongos-${PSMDB_VERSION} \
+        mongodb-org-tools-${PSMDB_VERSION} \
+        numactl-libs \
+        jq \
+        oniguruma \
+        cyrus-sasl-gssapi \
+        cyrus-sasl-plain; \
+    \
+    # Clean up package cache
+    microdnf clean all; \
+    rm -rf /var/cache/yum; \
+    \
+    # Create necessary directories with proper permissions
+    mkdir -p ${MONGODB_DATA_DIR} ${MONGODB_LOG_DIR} ${MONGODB_CONFIG_DIR} /tmp/mongodb; \
+    \
+    # Set up directory permissions for Kubernetes/OpenShift
+    chown -R ${MONGODB_UID}:${MONGODB_GID} ${MONGODB_DATA_DIR} ${MONGODB_LOG_DIR} ${MONGODB_CONFIG_DIR} /tmp/mongodb; \
+    chmod -R g+rwx ${MONGODB_DATA_DIR} ${MONGODB_LOG_DIR} ${MONGODB_CONFIG_DIR} /tmp/mongodb; \
+    chmod -R o-rwx ${MONGODB_DATA_DIR} ${MONGODB_LOG_DIR} ${MONGODB_CONFIG_DIR}
+
+# Create MongoDB user with Kubernetes/OpenShift compatibility
+RUN set -ex; \
+    # Create mongodb user with specific UID for Kubernetes
+    useradd -u ${MONGODB_UID} -r -g ${MONGODB_GID} -m -s /sbin/nologin \
+            -c "MongoDB Application User" -d /home/mongodb ${MONGODB_USER}; \
+    \
+    # Ensure proper ownership and permissions
+    chown -R ${MONGODB_UID}:${MONGODB_GID} /home/mongodb; \
+    chmod -R g+rwx /home/mongodb
+
+# Install gosu for privilege dropping with multi-arch support
+RUN set -eux; \
+    ARCH=$(uname -m); \
+    case "$ARCH" in \
+        x86_64) GOSU_ARCH="amd64" ;; \
+        aarch64) GOSU_ARCH="arm64" ;; \
+        *) echo "Unsupported architecture for gosu: $ARCH" && exit 1 ;; \
+    esac; \
+    \
+    curl -fsSL -o /usr/bin/gosu "https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${GOSU_ARCH}"; \
+    curl -fsSL -o /usr/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${GOSU_ARCH}.asc"; \
+    \
+    export GNUPGHOME="$(mktemp -d)"; \
+    gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4; \
+    gpg --batch --verify /usr/bin/gosu.asc /usr/bin/gosu; \
+    rm -rf "$GNUPGHOME" /usr/bin/gosu.asc; \
+    \
+    chmod +x /usr/bin/gosu; \
+    gosu --version; \
+    gosu nobody true
+
+# Install js-yaml for configuration parsing
+RUN set -ex; \
+    curl -fsSL https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js -o /js-yaml.js; \
+    echo "45dc3dd03dc07a06705a2c2989b8c7f709013f04bd5386e3279d4e447f07ebd7  /js-yaml.js" | sha256sum -c -; \
+    chmod 644 /js-yaml.js
+
+# Copy license files
+COPY LICENSE /licenses/LICENSE.Dockerfile
+RUN set -ex; \
+    mkdir -p /licenses; \
+    cp /usr/share/doc/mongodb-org-server/LICENSE-Community.txt /licenses/LICENSE.MongoDB-Community 2>/dev/null || \
+    echo "MongoDB Community License (SSPL-1.0)" > /licenses/LICENSE.MongoDB-Community; \
+    curl -fsSL -o /licenses/LICENSE.gosu "https://raw.githubusercontent.com/tianon/gosu/${GOSU_VERSION}/LICENSE"; \
+    chmod 644 /licenses/*
+
+# Copy entrypoint and health check scripts
+COPY ps-entry.sh /entrypoint.sh
+COPY healthcheck.sh /healthcheck.sh
+
+# Set up scripts with proper permissions
+RUN set -ex; \
+    chmod +x /entrypoint.sh /healthcheck.sh; \
+    chown ${MONGODB_UID}:${MONGODB_GID} /entrypoint.sh /healthcheck.sh
+
+# Create MongoDB configuration template
+RUN set -ex; \
+    cat > ${MONGODB_CONFIG_DIR}/mongod.conf.template << 'EOF'
+# MongoDB configuration file template for Kubernetes
+storage:
+  dbPath: /data/db
+  wiredTiger:
+    engineConfig:
+      cacheSizeGB: 0.25
+
+systemLog:
+  destination: file
+  logAppend: true
+  path: /var/log/mongodb/mongod.log
+  logRotate: reopen
+
+net:
+  port: 27017
+  bindIpAll: true
+
+processManagement:
+  timeZoneInfo: /usr/share/zoneinfo
+
+security:
+  authorization: disabled
+
+replication:
+  replSetName: rs0
+
+operationProfiling:
+  slowOpThresholdMs: 100
+EOF
+
+# Set up health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD /healthcheck.sh
+
+# Kubernetes-specific volume declarations
+VOLUME ["${MONGODB_DATA_DIR}", "${MONGODB_LOG_DIR}"]
+
+# Expose MongoDB port
+EXPOSE 27017
+
+# Use entrypoint for MongoDB initialization
+ENTRYPOINT ["/entrypoint.sh"]
+
+# Switch to non-root user
+USER ${MONGODB_UID}
+
+# Default command
+CMD ["mongod"]

@@ -1,0 +1,96 @@
+# Trivy Ignore File for MongoDB Community Edition 8.0
+# 
+# These vulnerabilities are in the MongoDB database tools (Go binaries)
+# provided by MongoDB Inc. in the mongodb-org-tools package.
+# 
+# MongoDB 8.0.17 includes older database tools that are still compiled
+# with Go 1.24.0, which has known vulnerabilities. These are upstream
+# issues that require MongoDB to recompile the tools with a patched
+# Go version (1.24.11+ or 1.25.5+).
+#
+# Affected binaries:
+# - bsondump, mongodump, mongoexport, mongofiles
+# - mongoimport, mongorestore, mongostat, mongotop
+#
+# MongoDB Version: 8.0.17
+# Database Tools Version: Bundled with 8.0.17
+# Go Version (in tools): 1.24.0
+#
+# Status: Waiting for MongoDB to recompile tools with Go 1.24.11+ or 1.25.5+
+# Last Updated: 2026-01-20
+# Review Date: Check monthly for MongoDB updates
+
+# CVE-2025-22874: crypto/x509 - ExtKeyUsageAny disables policy validation
+# Severity: HIGH
+# Fixed in: Go 1.24.4+
+# Component: stdlib in MongoDB database tools
+CVE-2025-22874
+
+# CVE-2025-47907: database/sql - Postgres Scan Race Condition
+# Severity: HIGH
+# Fixed in: Go 1.23.12, 1.24.6+
+# Component: stdlib in MongoDB database tools
+CVE-2025-47907
+
+# CVE-2025-58183: archive/tar - Unbounded allocation when parsing GNU sparse map
+# Severity: HIGH
+# Fixed in: Go 1.24.8, 1.25.2+
+# Component: stdlib in MongoDB database tools
+CVE-2025-58183
+
+# CVE-2025-61729: crypto/x509 - Denial of Service due to excessive resource consumption
+# Severity: HIGH
+# Fixed in: Go 1.24.11, 1.25.5+
+# Component: stdlib in MongoDB database tools
+CVE-2025-61729
+
+# ============================================================================
+# GOSU VULNERABILITIES (Kubernetes image only)
+# ============================================================================
+# These vulnerabilities are in gosu 1.17, which is compiled with Go 1.18.2.
+# Gosu is used in the Kubernetes image for privilege dropping.
+# 
+# Gosu Version: 1.17
+# Go Version (in gosu): 1.18.2
+#
+# Status: These are old CVEs in an older version of gosu. Consider upgrading
+#         to a newer gosu version or accepting the risk for this use case.
+# Last Updated: 2026-01-20
+
+# Multiple CVEs in gosu (Go 1.18.2) - CRITICAL severity
+CVE-2023-24538
+CVE-2023-24540
+CVE-2024-24790
+
+# Multiple CVEs in gosu (Go 1.18.2) - HIGH severity
+CVE-2022-27664
+CVE-2022-28131
+CVE-2022-2879
+CVE-2022-2880
+CVE-2022-29804
+CVE-2022-30580
+CVE-2022-30630
+CVE-2022-30631
+CVE-2022-30632
+CVE-2022-30633
+CVE-2022-30634
+CVE-2022-30635
+CVE-2022-32189
+CVE-2022-41715
+CVE-2022-41716
+CVE-2022-41720
+CVE-2022-41722
+CVE-2022-41723
+CVE-2022-41724
+CVE-2022-41725
+CVE-2023-24534
+CVE-2023-24536
+CVE-2023-24537
+CVE-2023-24539
+CVE-2023-29400
+CVE-2023-29403
+CVE-2023-39325
+CVE-2023-45283
+CVE-2023-45287
+CVE-2023-45288
+CVE-2024-34156

@@ -1,0 +1,45 @@
+# Trivy Ignore File for MongoDB Community Edition 8.2
+# 
+# These vulnerabilities are in the MongoDB database tools (Go binaries)
+# provided by MongoDB Inc. in the mongodb-database-tools package.
+# 
+# MongoDB 8.2.3 includes mongodb-database-tools-100.14.0, but the tools
+# are still compiled with Go 1.24.0, which has known vulnerabilities.
+# These are upstream issues that require MongoDB to recompile the tools
+# with a patched Go version (1.24.11+ or 1.25.5+).
+#
+# Affected binaries:
+# - bsondump, mongodump, mongoexport, mongofiles
+# - mongoimport, mongorestore, mongostat, mongotop
+#
+# MongoDB Version: 8.2.3
+# Database Tools Version: 100.14.0
+# Go Version (in tools): 1.24.0
+#
+# Status: Waiting for MongoDB to recompile tools with Go 1.24.11+ or 1.25.5+
+# Last Updated: 2026-01-20
+# Review Date: Check monthly for MongoDB updates
+
+# CVE-2025-22874: crypto/x509 - ExtKeyUsageAny disables policy validation
+# Severity: HIGH
+# Fixed in: Go 1.24.4+
+# Component: stdlib in MongoDB database tools
+CVE-2025-22874
+
+# CVE-2025-47907: database/sql - Postgres Scan Race Condition
+# Severity: HIGH
+# Fixed in: Go 1.23.12, 1.24.6+
+# Component: stdlib in MongoDB database tools
+CVE-2025-47907
+
+# CVE-2025-58183: archive/tar - Unbounded allocation when parsing GNU sparse map
+# Severity: HIGH
+# Fixed in: Go 1.24.8, 1.25.2+
+# Component: stdlib in MongoDB database tools
+CVE-2025-58183
+
+# CVE-2025-61729: crypto/x509 - Denial of Service due to excessive resource consumption
+# Severity: HIGH
+# Fixed in: Go 1.24.11, 1.25.5+
+# Component: stdlib in MongoDB database tools
+CVE-2025-61729

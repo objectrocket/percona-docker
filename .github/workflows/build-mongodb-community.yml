@@ -1,0 +1,226 @@
+name: Build MongoDB Community Images
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'percona-server-mongodb-8.0-community/**'
+      - '.github/workflows/build-mongodb-community.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'percona-server-mongodb-8.0-community/**'
+      - '.github/workflows/build-mongodb-community.yml'
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      push_images:
+        description: 'Push images to registry (true/false)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: objectrocket/percona-docker/percona-server-mongodb-8.0-community
+  MONGODB_VERSION: 8.0.3
+
+jobs:
+  build-and-push:
+    name: Build and Push MongoDB Community Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: standard
+            dockerfile: Dockerfile
+            suffix: ''
+          - name: k8s
+            dockerfile: Dockerfile.k8s
+            suffix: '-k8s'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up QEMU for multi-architecture builds
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+      
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=auto
+            suffix=${{ matrix.variant.suffix }},onlatest=true
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ env.MONGODB_VERSION }}
+            type=raw,value=8.0
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'release' }}
+            type=ref,event=pr
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=MongoDB Community Edition ${{ matrix.variant.name }}
+            org.opencontainers.image.description=Multi-architecture MongoDB Community Edition ${{ matrix.variant.name }} variant
+            org.opencontainers.image.version=${{ env.MONGODB_VERSION }}
+            org.opencontainers.image.vendor=ObjectRocket
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.licenses=SSPL-1.0
+            io.objectrocket.mongodb.version=${{ env.MONGODB_VERSION }}
+            io.objectrocket.variant=${{ matrix.variant.name }}
+      
+      - name: Verify healthcheck.sh exists for k8s variant
+        if: matrix.variant.name == 'k8s'
+        run: |
+          if [ ! -f percona-server-mongodb-8.0-community/healthcheck.sh ]; then
+            echo "Error: healthcheck.sh not found for k8s variant"
+            exit 1
+          fi
+          if [ ! -x percona-server-mongodb-8.0-community/healthcheck.sh ]; then
+            echo "Warning: healthcheck.sh is not executable, setting permissions"
+            chmod +x percona-server-mongodb-8.0-community/healthcheck.sh
+          fi
+          echo "✓ healthcheck.sh verified"
+      
+      - name: Build and push Docker image
+        id: build-push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./percona-server-mongodb-8.0-community
+          file: ./percona-server-mongodb-8.0-community/${{ matrix.variant.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' && (github.event_name == 'release' || github.ref == 'refs/heads/main' || github.event.inputs.push_images == 'true') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.variant.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant.name }}
+          provenance: true
+          sbom: true
+      
+      - name: Generate build summary
+        run: |
+          echo "## Build Summary - ${{ matrix.variant.name }} variant" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Variant:** ${{ matrix.variant.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Dockerfile:** ${{ matrix.variant.dockerfile }}" >> $GITHUB_STEP_SUMMARY
+          echo "**MongoDB Version:** ${{ env.MONGODB_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Platforms:** linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+          echo "**Digest:** \`${{ steps.build-push.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Tags" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const variant = '${{ matrix.variant.name }}';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            
+            if (context.eventName === 'pull_request') {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `❌ MongoDB Community image build failed for **${variant}** variant.\n\n[View workflow run](${runUrl})`
+              });
+            }
+            
+            core.setFailed(`Build failed for ${variant} variant`);
+  
+  verify-images:
+    name: Verify Published Images
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Verify standard image
+        run: |
+          echo "Verifying standard image..."
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MONGODB_VERSION }}
+          docker inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MONGODB_VERSION }}
+          echo "✓ Standard image verified"
+      
+      - name: Verify k8s image
+        run: |
+          echo "Verifying k8s image..."
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MONGODB_VERSION }}-k8s
+          docker inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MONGODB_VERSION }}-k8s
+          
+          # Verify healthcheck.sh exists in k8s image
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MONGODB_VERSION }}-k8s test -x /healthcheck.sh
+          echo "✓ K8s image verified with healthcheck.sh"
+      
+      - name: Verify multi-architecture support
+        run: |
+          echo "Verifying multi-architecture manifests..."
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MONGODB_VERSION }}
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MONGODB_VERSION }}-k8s
+          echo "✓ Multi-architecture support verified"
+      
+      - name: Generate verification summary
+        run: |
+          echo "## Image Verification Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ All images verified successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** \`${{ env.REGISTRY }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** \`${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ env.MONGODB_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Available Images" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MONGODB_VERSION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MONGODB_VERSION }}-k8s\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:8.0\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:8.0-k8s\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-k8s\`" >> $GITHUB_STEP_SUMMARY
