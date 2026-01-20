@@ -9,20 +9,20 @@ FROM --platform=${TARGETPLATFORM} redhat/ubi9-minimal
 
 # Kubernetes and OpenShift compatibility labels
 LABEL name="MongoDB Community Edition for Kubernetes" \
-    release="8.0" \
-    version="8.0.17" \
+    release="8.2" \
+    version="8.2.3" \
     vendor="MongoDB Inc." \
     summary="MongoDB Community Edition optimized for Kubernetes with Percona operator compatibility" \
     description="Multi-architecture MongoDB Community Edition container optimized for Kubernetes deployments. Includes enhanced security, health checks, and operator integration." \
     maintainer="Percona Development <info@percona.com>" \
     io.k8s.description="MongoDB Community Edition for Kubernetes" \
-    io.k8s.display-name="MongoDB Community 8.0" \
+    io.k8s.display-name="MongoDB Community 8.2" \
     io.openshift.expose-services="27017:mongodb" \
     io.openshift.tags="database,mongodb,nosql"
 
 LABEL org.opencontainers.image.title="MongoDB Community Edition for Kubernetes" \
     org.opencontainers.image.description="Multi-architecture MongoDB Community Edition optimized for Kubernetes" \
-    org.opencontainers.image.version="8.0.17" \
+    org.opencontainers.image.version="8.2.3" \
     org.opencontainers.image.authors="info@percona.com" \
     org.opencontainers.image.vendor="Percona" \
     org.opencontainers.image.licenses="SSPL-1.0" \
@@ -30,9 +30,9 @@ LABEL org.opencontainers.image.title="MongoDB Community Edition for Kubernetes" 
     org.opencontainers.image.documentation="https://docs.percona.com/"
 
 # Environment variables for MongoDB and Kubernetes
-ENV PSMDB_VERSION=8.0.17 \
+ENV PSMDB_VERSION=8.2.3 \
     OS_VER=el9 \
-    MONGODB_VERSION=8.0 \
+    MONGODB_VERSION=8.2 \
     GOSU_VERSION=1.17 \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 

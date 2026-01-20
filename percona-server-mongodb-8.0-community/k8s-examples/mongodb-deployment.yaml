@@ -1,0 +1,231 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mongodb
+  labels:
+    name: mongodb
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongodb-config
+  namespace: mongodb
+data:
+  mongod.conf: |
+    # MongoDB configuration for Kubernetes
+    storage:
+      dbPath: /data/db
+      journal:
+        enabled: true
+      wiredTiger:
+        engineConfig:
+          cacheSizeGB: 1.0
+    
+    systemLog:
+      destination: file
+      logAppend: true
+      path: /var/log/mongodb/mongod.log
+      logRotate: reopen
+      verbosity: 1
+    
+    net:
+      port: 27017
+      bindIpAll: true
+      maxIncomingConnections: 1000
+    
+    processManagement:
+      timeZoneInfo: /usr/share/zoneinfo
+    
+    security:
+      authorization: enabled
+    
+    replication:
+      replSetName: rs0
+    
+    operationProfiling:
+      slowOpThresholdMs: 100
+      mode: slowOp
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mongodb-secret
+  namespace: mongodb
+type: Opaque
+data:
+  # echo -n 'admin' | base64
+  username: YWRtaW4=
+  # echo -n 'SecurePassword123!' | base64
+  password: U2VjdXJlUGFzc3dvcmQxMjMh
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-service
+  namespace: mongodb
+  labels:
+    app: mongodb
+spec:
+  type: ClusterIP
+  ports:
+    - port: 27017
+      targetPort: 27017
+      protocol: TCP
+      name: mongodb
+  selector:
+    app: mongodb
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-headless
+  namespace: mongodb
+  labels:
+    app: mongodb
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: 27017
+      targetPort: 27017
+      protocol: TCP
+      name: mongodb
+  selector:
+    app: mongodb
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  namespace: mongodb
+  labels:
+    app: mongodb
+spec:
+  serviceName: mongodb-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      securityContext:
+        runAsUser: 1001
+        runAsGroup: 0
+        fsGroup: 0
+        runAsNonRoot: true
+      containers:
+      - name: mongodb
+        image: percona/percona-server-mongodb:8.0-community-k8s
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 27017
+          name: mongodb
+          protocol: TCP
+        env:
+        - name: MONGO_INITDB_ROOT_USERNAME_FILE
+          value: /etc/mongodb-secret/username
+        - name: MONGO_INITDB_ROOT_PASSWORD_FILE
+          value: /etc/mongodb-secret/password
+        - name: MONGO_INITDB_DATABASE
+          value: admin
+        - name: REPLICA_SET_NAME
+          value: rs0
+        - name: K8S_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: K8S_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: K8S_SERVICE_NAME
+          value: mongodb-headless
+        - name: MONGODB_DATA_DIR
+          value: /data/db
+        - name: MONGODB_LOG_DIR
+          value: /var/log/mongodb
+        - name: MONGODB_CONFIG_DIR
+          value: /etc/mongodb
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: mongodb-data
+          mountPath: /data/db
+        - name: mongodb-logs
+          mountPath: /var/log/mongodb
+        - name: mongodb-config
+          mountPath: /etc/mongodb/mongod.conf.template
+          subPath: mongod.conf
+          readOnly: true
+        - name: mongodb-secret
+          mountPath: /etc/mongodb-secret
+          readOnly: true
+        livenessProbe:
+          exec:
+            command:
+            - /healthcheck.sh
+            - liveness
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+          successThreshold: 1
+        readinessProbe:
+          exec:
+            command:
+            - /healthcheck.sh
+            - readiness
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+        startupProbe:
+          exec:
+            command:
+            - /healthcheck.sh
+            - startup
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 30
+          failureThreshold: 30
+          successThreshold: 1
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 0
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: mongodb-config
+        configMap:
+          name: mongodb-config
+          defaultMode: 0644
+      - name: mongodb-secret
+        secret:
+          secretName: mongodb-secret
+          defaultMode: 0400
+      - name: mongodb-logs
+        emptyDir: {}
+      terminationGracePeriodSeconds: 30
+      restartPolicy: Always
+  volumeClaimTemplates:
+  - metadata:
+      name: mongodb-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: "standard"
+      resources:
+        requests:
+          storage: 10Gi
